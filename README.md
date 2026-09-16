@@ -1,4 +1,4 @@
-# CITS3011 Intelligent Agent Project
+# CITS3011 Intelligent Agent Project (Group 57)
 
 This project is to be completed in groups of two or three students.
 
