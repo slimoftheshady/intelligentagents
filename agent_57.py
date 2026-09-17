@@ -27,12 +27,14 @@ class StudentAgent(Agent):
         super().__init__(agent_name)
         self.map_graph_army = None
         self.map_graph_navy = None
+        self._adjacent_turns = {}
 
     @_timeout(1)
     def new_game(self, game, power_name):
         self.game = game
         self.power_name = power_name
         self.build_map_graphs()
+        self._adjacent_turns = {}
 
     def build_map_graphs(self):
         self.map_graph_army = nx.Graph()
@@ -104,6 +106,52 @@ class StudentAgent(Agent):
                 return o
         return None
 
+    def _find_convoy(self, loc, dest, possible):
+        """Try to find a legal convoy order for the army at loc to dest."""
+        lu, du = loc.upper(), dest.upper()
+        for o in possible:
+            p = o.split(' ')
+            # 'A LVP - BEL VIA'
+            if (len(p) >= 5 and p[0] == 'A' and p[1].upper() == lu
+                    and p[2] == '-' and p[3].upper() == du
+                    and p[4].upper() == 'VIA'):
+                return o
+        return None
+
+    def _find_convoyed_move(self, loc, dest, possible):
+        """Return ANY convoy order from loc (destination may be flexible)."""
+        lu = loc.upper()
+        for o in possible:
+            p = o.split(' ')
+            if (len(p) >= 5 and p[0] == 'A' and p[1].upper() == lu
+                    and p[2] == '-' and p[4].upper() == 'VIA'):
+                return o
+        return None
+
+    # ------------------------------------------------------------------
+    # England-specific opening moves (Spring/Fall 1901)
+    # ------------------------------------------------------------------
+    def _england_opening(self, all_possible_orders, orderable_locations, phase):
+        """
+        England needs to escape its island. Hard-code the standard convoy
+        opening: move fleets to ENG and NTH in Spring 1901, then convoy the
+        army to BEL in Fall 1901.
+        """
+        plan = {}
+        # Turn key: year+season from current phase
+        # phase is like 'S1901M' or 'F1901M'
+        yr = self.game.get_current_phase()
+
+        if 'S1901M' in yr:
+            plan['LON'] = 'F LON - ENG'
+            plan['EDI'] = 'F EDI - NTH'
+            plan['LVP'] = 'A LVP - YOR'
+        elif 'F1901M' in yr:
+            plan['ENG'] = 'F ENG C A YOR - BEL'
+            plan['NTH'] = 'F NTH - NWY'
+            plan['YOR'] = 'A YOR - BEL'
+        return plan
+
     # ------------------------------------------------------------------
     # Movement phase
     # ------------------------------------------------------------------
@@ -115,7 +163,33 @@ class StudentAgent(Agent):
         targets = [sc for sc in all_scs if sc not in my_centers]
         targets_set = set(targets)
 
-        # Occupied enemy centres
+        # ---- England opening override ----
+        if self.power_name == 'ENGLAND':
+            plan = self._england_opening(all_possible_orders, orderable_locations, None)
+            if plan:
+                out = []
+                used_in_plan = set()
+                for loc in orderable_locations:
+                    # match by the origin token (last word before H/move)
+                    matched = False
+                    for key, order in plan.items():
+                        parts = order.split(' ')
+                        if len(parts) >= 2 and parts[1].upper() == loc.upper():
+                            # Verify the order is in possible
+                            if order in all_possible_orders.get(loc, []):
+                                out.append(order)
+                                used_in_plan.add(loc)
+                                matched = True
+                                break
+                    if not matched:
+                        # fall through to normal logic for this unit
+                        pass
+                if len(used_in_plan) == len(orderable_locations):
+                    return out
+                # Otherwise, we'll fall through and mix with normal logic
+                # (rare; the opening should cover all 3 units)
+
+        # Enemy-occupied centres
         occupied_by = {}
         for p in self.game.powers.keys():
             try:
@@ -133,6 +207,7 @@ class StudentAgent(Agent):
         # Per-unit data
         unit_options = {}
         unit_paths = {}
+        unit_kind = {}
         for loc in orderable_locations:
             possible = all_possible_orders.get(loc, [])
             if not possible:
@@ -140,8 +215,10 @@ class StudentAgent(Agent):
             unit_options[loc] = possible
             if any(o.startswith('A') for o in possible):
                 graph = self.map_graph_army
+                unit_kind[loc] = 'A'
             elif any(o.startswith('F') for o in possible):
                 graph = self.map_graph_navy
+                unit_kind[loc] = 'F'
             else:
                 unit_paths[loc] = {}
                 continue
@@ -169,10 +246,10 @@ class StudentAgent(Agent):
                     orders[loc] = h
                     used.add(loc)
 
-        # Step 2: claim UNOCCUPIED targets with the single nearest free unit
+        # Step 2: claim UNOCCUPIED targets
         unoccupied_targets = [t for t in targets
                               if t not in occupied_by or occupied_by[t] == self.power_name]
-        # Sort targets by their globally nearest free unit distance
+
         def nearest_free_to(t):
             best = (float('inf'), None)
             for loc in unit_options:
@@ -187,9 +264,7 @@ class StudentAgent(Agent):
 
         for t in unoccupied_targets:
             d, loc = nearest_free_to(t)
-            if loc is None:
-                continue
-            if d == float('inf'):
+            if loc is None or d == float('inf'):
                 continue
             p = unit_paths[loc].get(t, [])
             if len(p) <= 1:
@@ -198,18 +273,32 @@ class StudentAgent(Agent):
                 used.add(loc)
                 continue
             step = p[1]
-            mv = self._find_move(loc, step, unit_options[loc]) or self._any_move(loc, unit_options[loc])
+
+            # Try normal move
+            mv = self._find_move(loc, step, unit_options[loc])
+            # If unit is an army and no normal move to `step`, try a convoy
+            if mv is None and unit_kind.get(loc) == 'A':
+                cv = self._find_convoy(loc, t, unit_options[loc])
+                if cv is None:
+                    cv = self._find_convoyed_move(loc, t, unit_options[loc])
+                if cv is not None:
+                    orders[loc] = cv
+                    used.add(loc)
+                    continue
+            if mv is None:
+                mv = self._any_move(loc, unit_options[loc])
             if mv is not None:
                 orders[loc] = mv
                 used.add(loc)
 
-        # Step 3: dislodge OCCUPIED targets with mover + supporter
+        # Step 3: dislodge OCCUPIED targets
         occupied_targets = [t for t in targets
                             if t in occupied_by and occupied_by[t] != self.power_name]
         occupied_targets.sort(key=lambda t: nearest_free_to(t)[0])
 
+        new_adjacent = {}
+
         for t in occupied_targets:
-            # Find two closest free units
             candidates = []
             for loc in unit_options:
                 if loc in used:
@@ -221,14 +310,10 @@ class StudentAgent(Agent):
             if not candidates:
                 continue
 
-            # If a unit is already adjacent (d==2), use it as supporter if
-            # another unit is adjacent too. Otherwise, send closest to be
-            # adjacent, and second-closest to be adjacent next turn.
             adjacent = [c for c in candidates if c[0] == 2]
             approaching = [c for c in candidates if c[0] > 2]
 
             if len(adjacent) >= 2:
-                # Do a supported attack now
                 mover = adjacent[0][1]
                 supporter = adjacent[1][1]
                 sup = self._find_support(supporter, mover, t, unit_options[supporter])
@@ -240,14 +325,23 @@ class StudentAgent(Agent):
                     used.add(supporter)
                     continue
 
-            if len(adjacent) >= 1 and len(approaching) >= 1:
-                # Adjacent one holds (to support next turn), approaching one advances
+            if len(adjacent) == 1 and len(approaching) >= 1:
                 adj_unit = adjacent[0][1]
-                h = self._hold_order(adj_unit, unit_options[adj_unit])
-                if h is not None:
-                    orders[adj_unit] = h
-                    used.add(adj_unit)
-                # Approaching unit moves one step toward t
+                stuck = self._adjacent_turns.get(adj_unit, 0)
+                if stuck >= 2:
+                    if not self._send_to_nearest_unoccupied(
+                            adj_unit, unoccupied_targets, unit_options,
+                            unit_paths, orders, used):
+                        h = self._hold_order(adj_unit, unit_options[adj_unit])
+                        if h is not None:
+                            orders[adj_unit] = h
+                            used.add(adj_unit)
+                else:
+                    h = self._hold_order(adj_unit, unit_options[adj_unit])
+                    if h is not None:
+                        orders[adj_unit] = h
+                        used.add(adj_unit)
+                    new_adjacent[adj_unit] = stuck + 1
                 appr_unit = approaching[0][1]
                 p = unit_paths[appr_unit].get(t, [])
                 if len(p) > 1:
@@ -257,17 +351,26 @@ class StudentAgent(Agent):
                         used.add(appr_unit)
                 continue
 
-            if len(adjacent) == 1 and len(approaching) == 0:
-                # Only one adjacent -> hold; wait for reinforcement next turn
+            if len(adjacent) == 1 and not approaching:
                 adj_unit = adjacent[0][1]
-                h = self._hold_order(adj_unit, unit_options[adj_unit])
-                if h is not None:
-                    orders[adj_unit] = h
-                    used.add(adj_unit)
+                stuck = self._adjacent_turns.get(adj_unit, 0)
+                if stuck >= 2:
+                    if not self._send_to_nearest_unoccupied(
+                            adj_unit, unoccupied_targets, unit_options,
+                            unit_paths, orders, used):
+                        h = self._hold_order(adj_unit, unit_options[adj_unit])
+                        if h is not None:
+                            orders[adj_unit] = h
+                            used.add(adj_unit)
+                else:
+                    h = self._hold_order(adj_unit, unit_options[adj_unit])
+                    if h is not None:
+                        orders[adj_unit] = h
+                        used.add(adj_unit)
+                    new_adjacent[adj_unit] = stuck + 1
                 continue
 
             if len(approaching) >= 2:
-                # Send two units to approach t (they'll both be adjacent next turn)
                 for _, loc in approaching[:2]:
                     p = unit_paths[loc].get(t, [])
                     if len(p) > 1:
@@ -286,7 +389,7 @@ class StudentAgent(Agent):
                         orders[loc] = mv
                         used.add(loc)
 
-        # Step 4: any remaining unit -> hold or move toward nearest target
+        # Step 4: remaining
         for loc in unit_options:
             if loc in used:
                 continue
@@ -301,14 +404,53 @@ class StudentAgent(Agent):
             else:
                 p = unit_paths[loc].get(best_t, [])
                 if len(p) > 1:
-                    mv = self._find_move(loc, p[1], unit_options[loc]) or self._any_move(loc, unit_options[loc])
+                    mv = self._find_move(loc, p[1], unit_options[loc])
+                    if mv is None and unit_kind.get(loc) == 'A':
+                        cv = self._find_convoy(loc, best_t, unit_options[loc])
+                        if cv is not None:
+                            orders[loc] = cv
+                            used.add(loc)
+                            continue
+                    mv = mv or self._any_move(loc, unit_options[loc])
                     orders[loc] = mv if mv is not None else (self._hold_order(loc, unit_options[loc]) or unit_options[loc][0])
                 else:
                     h = self._hold_order(loc, unit_options[loc])
                     orders[loc] = h if h is not None else unit_options[loc][0]
             used.add(loc)
 
+        self._adjacent_turns = new_adjacent
         return [orders[loc] for loc in orderable_locations if loc in orders]
+
+    def _send_to_nearest_unoccupied(self, loc, unoccupied_targets, unit_options,
+                                     unit_paths, orders, used):
+        best_d, best_t = float('inf'), None
+        loc_paths = unit_paths.get(loc, {})
+        for t in unoccupied_targets:
+            claimed = False
+            for other_loc, o in orders.items():
+                parts = o.split(' ')
+                if len(parts) >= 4 and parts[2] == '-':
+                    if parts[3].upper() == t:
+                        claimed = True
+                        break
+            if claimed:
+                continue
+            if t not in loc_paths:
+                continue
+            d = len(loc_paths[t])
+            if d < best_d:
+                best_d, best_t = d, t
+        if best_t is None or best_d == float('inf') or best_d <= 1:
+            return False
+        p = loc_paths.get(best_t, [])
+        if len(p) <= 1:
+            return False
+        mv = self._find_move(loc, p[1], unit_options[loc]) or self._any_move(loc, unit_options[loc])
+        if mv is not None:
+            orders[loc] = mv
+            used.add(loc)
+            return True
+        return False
 
     # ------------------------------------------------------------------
     def _retreat_orders(self):
@@ -334,14 +476,21 @@ class StudentAgent(Agent):
         all_possible_orders = self.game.get_all_possible_orders()
         orderable_locations = self.game.get_orderable_locations(self.power_name)
         out = []
+        prefer_fleet = (self.power_name == 'ENGLAND')
         for loc in orderable_locations:
             possible = all_possible_orders.get(loc, [])
             if not possible:
                 continue
             b = [o for o in possible if o.endswith(' B')]
             if b:
-                a = [o for o in b if o.startswith('A')]
-                out.append(a[0] if a else b[0])
+                fleet_builds = [o for o in b if o.startswith('F')]
+                army_builds = [o for o in b if o.startswith('A')]
+                if prefer_fleet and fleet_builds:
+                    out.append(fleet_builds[0])
+                elif army_builds:
+                    out.append(army_builds[0])
+                else:
+                    out.append(b[0])
             else:
                 d = [o for o in possible if o.endswith(' D')]
                 out.append(d[0] if d else possible[0])
