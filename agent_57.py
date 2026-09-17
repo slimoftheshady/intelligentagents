@@ -12,34 +12,15 @@ else:
             return func
         return decorator
 
+DEBUG = False
+
+def _dbg(*args):
+    if DEBUG:
+        print('[StudentAgent]', *args)
+
 
 class StudentAgent(Agent):
-    '''
-    Scenario 1 agent: opponents are all Static Agents (always Hold).
-
-    Since Static Agents never move and never support, the map is essentially
-    a race to capture all 34 supply centres. Two mechanisms are needed:
-
-    1. Capture neutral (unowned) centres by moving onto them.
-    2. Dislodge Static units sitting on their home centres using SUPPORTED
-       ATTACKS - a supported attack (strength 2) beats an unsupported
-       defence (strength 1). A bare move into an occupied centre bounces.
-
-    Strategy per phase:
-      - Movement:
-          * Build a target list: every supply centre we don't own.
-          * Decide per unit what action helps most:
-              (a) If standing on a target centre -> HOLD (capture).
-              (b) Else, move toward the nearest target that no other unit
-                  of ours is already assigned to "move into" this turn,
-                  UNLESS that target is occupied by an enemy unit and we
-                  already have one mover assigned -> then SUPPORT the mover.
-          * Concretely: for each target, pick the 1 or 2 nearest of our
-            units. If the target is occupied, use one as mover and one as
-            supporter. If empty, just one mover.
-      - Adjustment: build at every home centre where legal (prefer armies).
-      - Retreat: safety net (should never trigger).
-    '''
+    '''Scenario 1 agent: opponents are all Static Agents (always Hold).'''
 
     @_timeout(1)
     def __init__(self, agent_name='Scenario1Bot'):
@@ -56,14 +37,12 @@ class StudentAgent(Agent):
     def build_map_graphs(self):
         self.map_graph_army = nx.Graph()
         self.map_graph_navy = nx.Graph()
-
         locations = list(self.game.map.loc_type.keys())
         for i in locations:
             if self.game.map.loc_type[i] in ['LAND', 'COAST']:
                 self.map_graph_army.add_node(i.upper())
             if self.game.map.loc_type[i] in ['WATER', 'COAST']:
                 self.map_graph_navy.add_node(i.upper())
-
         locations = [i.upper() for i in locations]
         for i in locations:
             for j in locations:
@@ -87,80 +66,42 @@ class StudentAgent(Agent):
             return self._retreat_orders()
         elif phase_type == 'A':
             return self._adjustment_orders()
-        else:
-            return []
+        return []
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    # ---- case-insensitive order matching ----
     def _hold_order(self, loc, possible):
-        if not possible:
-            return None
-        unit_type = possible[0][0]
-        hold = f'{unit_type} {loc} H'
-        if hold in possible:
-            return hold
+        lu = loc.upper()
         for o in possible:
-            parts = o.split(' ')
-            if len(parts) == 3 and parts[0] == unit_type and parts[1] == loc and parts[2] == 'H':
+            p = o.split(' ')
+            if len(p) == 3 and p[1].upper() == lu and p[2].upper() == 'H':
                 return o
         return None
 
     def _find_move(self, loc, dest, possible):
-        """Return a valid move order from loc to dest, if one exists in possible."""
-        if not possible:
-            return None
-        unit_type = possible[0][0]
-        candidate = f'{unit_type} {loc} - {dest}'
-        if candidate in possible:
-            return candidate
+        lu, du = loc.upper(), dest.upper()
         for o in possible:
-            parts = o.split(' ')
-            if (len(parts) >= 4 and parts[0] == unit_type
-                    and parts[1] == loc and parts[2] == '-'
-                    and parts[3].upper() == dest.upper()):
+            p = o.split(' ')
+            if (len(p) >= 4 and p[2] == '-' and
+                    p[1].upper() == lu and p[3].upper() == du):
                 return o
         return None
 
-    def _find_support(self, loc, supported_unit_loc, supported_unit_dest, possible):
-        """
-        Return a valid support order for the unit at loc supporting the move
-        of a friendly unit from supported_unit_loc to supported_unit_dest.
-        """
-        if not possible:
-            return None
-        unit_type = possible[0][0]
-        supported_type = 'A'  # opponent units on SCs are armies or fleets; try both
-        # Try army-supported and fleet-supported forms
-        for st in ('A', 'F'):
-            candidate = f'{unit_type} {loc} S {st} {supported_unit_loc} - {supported_unit_dest}'
-            if candidate in possible:
-                return candidate
-        # Fuzzy match: unit_type, loc, 'S', then 'X ORIGIN - DEST'
-        target_origin = supported_unit_loc.upper()
-        target_dest = supported_unit_dest.upper()
+    def _find_support(self, loc, sup_orig, sup_dest, possible):
+        lu, ou, du = loc.upper(), sup_orig.upper(), sup_dest.upper()
         for o in possible:
-            parts = o.split(' ')
-            if len(parts) >= 7 and parts[0] == unit_type and parts[1] == loc and parts[2] == 'S':
-                if parts[4].upper() == target_origin and parts[5] == '-' and parts[6].upper() == target_dest:
+            p = o.split(' ')
+            if len(p) >= 7 and p[2] == 'S':
+                if (p[1].upper() == lu and p[4].upper() == ou
+                        and p[5] == '-' and p[6].upper() == du):
                     return o
         return None
 
-    def _find_support_hold(self, loc, supported_unit_loc, possible):
-        """Support a friendly unit that is HOLDING at supported_unit_loc."""
-        if not possible:
-            return None
-        unit_type = possible[0][0]
-        for st in ('A', 'F'):
-            candidate = f'{unit_type} {loc} S {st} {supported_unit_loc} H'
-            if candidate in possible:
-                return candidate
-        target_origin = supported_unit_loc.upper()
+    def _any_move(self, loc, possible):
+        lu = loc.upper()
         for o in possible:
-            parts = o.split(' ')
-            if len(parts) >= 6 and parts[0] == unit_type and parts[1] == loc and parts[2] == 'S':
-                if parts[4].upper() == target_origin and parts[5] == 'H':
-                    return o
+            p = o.split(' ')
+            if len(p) >= 4 and p[2] == '-' and p[1].upper() == lu:
+                return o
         return None
 
     # ------------------------------------------------------------------
@@ -170,252 +111,238 @@ class StudentAgent(Agent):
         all_possible_orders = self.game.get_all_possible_orders()
         orderable_locations = self.game.get_orderable_locations(self.power_name)
         my_centers = set(c.upper() for c in self.game.get_centers(self.power_name))
-
-        # All supply centres not currently owned by us
         all_scs = [sc.upper() for sc in self.game.map.scs]
         targets = [sc for sc in all_scs if sc not in my_centers]
-        target_set = set(targets)
+        targets_set = set(targets)
 
-        # Current unit locations of ALL powers (to detect occupied centres)
-        occupied_by = {}  # loc.upper() -> power_name
+        # Occupied enemy centres
+        occupied_by = {}
         for p in self.game.powers.keys():
-            for u in self.game.get_units(power_name=p):
-                # u looks like 'A PAR' or 'F LON'
+            try:
+                units = self.game.get_units(power_name=p)
+            except Exception:
+                try:
+                    units = self.game.get_units(p)
+                except Exception:
+                    units = []
+            for u in units:
                 parts = u.split(' ')
                 if len(parts) >= 2:
                     occupied_by[parts[1].upper()] = p
 
-        # Build per-unit information
-        unit_data = {}  # loc -> dict(type, graph, possible, army_opts, navy_opts)
+        # Per-unit data
+        unit_options = {}
+        unit_paths = {}
         for loc in orderable_locations:
             possible = all_possible_orders.get(loc, [])
             if not possible:
                 continue
-            army_opts = [o for o in possible if o.startswith('A')]
-            navy_opts = [o for o in possible if o.startswith('F')]
-            if army_opts:
+            unit_options[loc] = possible
+            if any(o.startswith('A') for o in possible):
                 graph = self.map_graph_army
-                utype = 'A'
-            elif navy_opts:
+            elif any(o.startswith('F') for o in possible):
                 graph = self.map_graph_navy
-                utype = 'F'
             else:
+                unit_paths[loc] = {}
                 continue
-            unit_data[loc] = {'type': utype, 'graph': graph, 'possible': possible}
-
-        # Cache shortest paths per unit (from its origin)
-        paths_cache = {}
-        for loc, data in unit_data.items():
-            graph = data['graph']
             lu = loc.upper()
-            if lu not in graph:
-                paths_cache[loc] = {}
-                continue
-            try:
-                paths_cache[loc] = nx.shortest_path(graph, source=lu)
-            except Exception:
-                paths_cache[loc] = {}
+            if lu in graph:
+                try:
+                    unit_paths[loc] = nx.shortest_path(graph, source=lu)
+                except Exception:
+                    unit_paths[loc] = {}
+            else:
+                unit_paths[loc] = {}
 
-        # ------------------------------------------------------------------
-        # Decide assignments
-        # ------------------------------------------------------------------
-        # order_map: loc -> order string
-        order_map = {}
-        # Track which unit is assigned to move into which target
-        mover_of_target = {}   # target -> loc (mover unit)
-        supporter_of_target = {}  # target -> loc (supporter unit)
-        assigned = set()  # locations of units that already have an order
+        def dist(loc, t):
+            p = unit_paths.get(loc, {})
+            return len(p[t]) if t in p else float('inf')
 
-        # Step 1: any unit standing on a target centre -> HOLD (capture)
-        for loc in unit_data:
-            if loc.upper() in target_set:
-                hold = self._hold_order(loc, unit_data[loc]['possible'])
-                if hold is not None:
-                    order_map[loc] = hold
-                    assigned.add(loc)
-                    mover_of_target[loc.upper()] = loc
+        orders = {}
+        used = set()
 
-        # Step 2: assign movers/supporters for each remaining target.
-        # Sort targets by distance from the nearest available unit so the
-        # closest opportunities are claimed first.
-        def nearest_available_dist(target):
+        # Step 1: hold on targets we're standing on
+        for loc in unit_options:
+            if loc.upper() in targets_set:
+                h = self._hold_order(loc, unit_options[loc])
+                if h is not None:
+                    orders[loc] = h
+                    used.add(loc)
+
+        # Step 2: claim UNOCCUPIED targets with the single nearest free unit
+        unoccupied_targets = [t for t in targets
+                              if t not in occupied_by or occupied_by[t] == self.power_name]
+        # Sort targets by their globally nearest free unit distance
+        def nearest_free_to(t):
             best = (float('inf'), None)
-            for loc, data in unit_data.items():
-                if loc in assigned:
+            for loc in unit_options:
+                if loc in used:
                     continue
-                paths = paths_cache.get(loc, {})
-                if target in paths:
-                    d = len(paths[target])
-                    if d < best[0]:
-                        best = (d, loc)
+                d = dist(loc, t)
+                if d < best[0]:
+                    best = (d, loc)
             return best
 
-        remaining_targets = [t for t in targets if t not in mover_of_target]
+        unoccupied_targets.sort(key=lambda t: nearest_free_to(t)[0])
 
-        # Iteratively assign: pick target with globally shortest available unit
-        while True:
-            best = (float('inf'), None, None)  # (dist, target, unit_loc)
-            for t in remaining_targets:
-                if t in mover_of_target:
-                    continue
-                d, loc = nearest_available_dist(t)
-                if loc is None:
-                    continue
-                if d < best[0]:
-                    best = (d, t, loc)
-            d, target, mover_loc = best
-            if mover_loc is None:
-                break
-
-            # We have a mover for `target`
-            mover_of_target[target] = mover_loc
-            assigned.add(mover_loc)
-
-            # Is the target occupied by an enemy (Static) unit?
-            occupied_enemy = (target in occupied_by and
-                              occupied_by[target] != self.power_name)
-
-            if occupied_enemy:
-                # Find a second unit adjacent to `target` that is free and
-                # can support. Prefer a unit whose shortest path to target
-                # is length 2 (i.e., can reach target in one step by staying
-                # adjacent and supporting), but any unit adjacent to target
-                # with a valid support order works.
-                supporter_loc = None
-                # We need a unit that can give "S X mover_loc - target",
-                # i.e. a unit already adjacent to target.
-                for loc, data in unit_data.items():
-                    if loc in assigned:
-                        continue
-                    if loc == mover_loc:
-                        continue
-                    # Must be adjacent to target
-                    if target not in paths_cache.get(loc, {}):
-                        continue
-                    if len(paths_cache[loc][target]) != 2:
-                        continue
-                    # Try to construct a support order
-                    sup = self._find_support(loc, mover_loc, target, data['possible'])
-                    if sup is not None:
-                        supporter_loc = loc
-                        order_map[loc] = sup
-                        assigned.add(loc)
-                        supporter_of_target[target] = loc
-                        break
-
-                # If no adjacent supporter is available, we need the mover to
-                # arrive adjacent this turn. That's fine - we'll support next
-                # turn. For now the mover just moves toward target and we
-                # defer the actual capture.
-                if supporter_loc is None:
-                    pass  # mover moves toward target as usual
-
-            # Remove this target from consideration
-            remaining_targets = [t for t in remaining_targets if t != target]
-
-        # Step 3: every still-unassigned unit moves toward the nearest
-        # unassigned target (its final destination may be one that already
-        # has a mover - that's fine, we just need the unit to advance).
-        for loc, data in unit_data.items():
-            if loc in assigned:
+        for t in unoccupied_targets:
+            d, loc = nearest_free_to(t)
+            if loc is None:
                 continue
-            possible = data['possible']
-            paths = paths_cache.get(loc, {})
+            if d == float('inf'):
+                continue
+            p = unit_paths[loc].get(t, [])
+            if len(p) <= 1:
+                h = self._hold_order(loc, unit_options[loc])
+                orders[loc] = h if h is not None else unit_options[loc][0]
+                used.add(loc)
+                continue
+            step = p[1]
+            mv = self._find_move(loc, step, unit_options[loc]) or self._any_move(loc, unit_options[loc])
+            if mv is not None:
+                orders[loc] = mv
+                used.add(loc)
 
-            # Prefer any target with no mover yet
-            best_target = None
-            best_dist = float('inf')
-            for t in remaining_targets:
-                if t in paths and len(paths[t]) < best_dist:
-                    best_dist = len(paths[t])
-                    best_target = t
+        # Step 3: dislodge OCCUPIED targets with mover + supporter
+        occupied_targets = [t for t in targets
+                            if t in occupied_by and occupied_by[t] != self.power_name]
+        occupied_targets.sort(key=lambda t: nearest_free_to(t)[0])
 
-            # If no unclaimed target is reachable, advance toward the
-            # nearest target overall (to set up future support/moves)
-            if best_target is None:
-                for t in targets:
-                    if t in paths and len(paths[t]) < best_dist:
-                        best_dist = len(paths[t])
-                        best_target = t
-
-            if best_target is None or best_dist <= 1:
-                hold = self._hold_order(loc, possible)
-                if hold is not None:
-                    order_map[loc] = hold
-                    assigned.add(loc)
+        for t in occupied_targets:
+            # Find two closest free units
+            candidates = []
+            for loc in unit_options:
+                if loc in used:
                     continue
-                order_map[loc] = random.choice(possible)
-                assigned.add(loc)
+                d = dist(loc, t)
+                if d != float('inf'):
+                    candidates.append((d, loc))
+            candidates.sort()
+            if not candidates:
                 continue
 
-            step = paths[best_target][1]
-            move = self._find_move(loc, step, possible)
-            if move is not None:
-                order_map[loc] = move
+            # If a unit is already adjacent (d==2), use it as supporter if
+            # another unit is adjacent too. Otherwise, send closest to be
+            # adjacent, and second-closest to be adjacent next turn.
+            adjacent = [c for c in candidates if c[0] == 2]
+            approaching = [c for c in candidates if c[0] > 2]
+
+            if len(adjacent) >= 2:
+                # Do a supported attack now
+                mover = adjacent[0][1]
+                supporter = adjacent[1][1]
+                sup = self._find_support(supporter, mover, t, unit_options[supporter])
+                mv = self._find_move(mover, t, unit_options[mover])
+                if sup is not None and mv is not None:
+                    orders[mover] = mv
+                    orders[supporter] = sup
+                    used.add(mover)
+                    used.add(supporter)
+                    continue
+
+            if len(adjacent) >= 1 and len(approaching) >= 1:
+                # Adjacent one holds (to support next turn), approaching one advances
+                adj_unit = adjacent[0][1]
+                h = self._hold_order(adj_unit, unit_options[adj_unit])
+                if h is not None:
+                    orders[adj_unit] = h
+                    used.add(adj_unit)
+                # Approaching unit moves one step toward t
+                appr_unit = approaching[0][1]
+                p = unit_paths[appr_unit].get(t, [])
+                if len(p) > 1:
+                    mv = self._find_move(appr_unit, p[1], unit_options[appr_unit]) or self._any_move(appr_unit, unit_options[appr_unit])
+                    if mv is not None:
+                        orders[appr_unit] = mv
+                        used.add(appr_unit)
+                continue
+
+            if len(adjacent) == 1 and len(approaching) == 0:
+                # Only one adjacent -> hold; wait for reinforcement next turn
+                adj_unit = adjacent[0][1]
+                h = self._hold_order(adj_unit, unit_options[adj_unit])
+                if h is not None:
+                    orders[adj_unit] = h
+                    used.add(adj_unit)
+                continue
+
+            if len(approaching) >= 2:
+                # Send two units to approach t (they'll both be adjacent next turn)
+                for _, loc in approaching[:2]:
+                    p = unit_paths[loc].get(t, [])
+                    if len(p) > 1:
+                        mv = self._find_move(loc, p[1], unit_options[loc]) or self._any_move(loc, unit_options[loc])
+                        if mv is not None:
+                            orders[loc] = mv
+                            used.add(loc)
+                continue
+
+            if len(approaching) == 1:
+                loc = approaching[0][1]
+                p = unit_paths[loc].get(t, [])
+                if len(p) > 1:
+                    mv = self._find_move(loc, p[1], unit_options[loc]) or self._any_move(loc, unit_options[loc])
+                    if mv is not None:
+                        orders[loc] = mv
+                        used.add(loc)
+
+        # Step 4: any remaining unit -> hold or move toward nearest target
+        for loc in unit_options:
+            if loc in used:
+                continue
+            best_d, best_t = float('inf'), None
+            for t in targets:
+                d = dist(loc, t)
+                if d < best_d:
+                    best_d, best_t = d, t
+            if best_t is None or best_d == float('inf') or best_d <= 1:
+                h = self._hold_order(loc, unit_options[loc])
+                orders[loc] = h if h is not None else unit_options[loc][0]
             else:
-                hold = self._hold_order(loc, possible)
-                order_map[loc] = hold if hold is not None else random.choice(possible)
-            assigned.add(loc)
+                p = unit_paths[loc].get(best_t, [])
+                if len(p) > 1:
+                    mv = self._find_move(loc, p[1], unit_options[loc]) or self._any_move(loc, unit_options[loc])
+                    orders[loc] = mv if mv is not None else (self._hold_order(loc, unit_options[loc]) or unit_options[loc][0])
+                else:
+                    h = self._hold_order(loc, unit_options[loc])
+                    orders[loc] = h if h is not None else unit_options[loc][0]
+            used.add(loc)
 
-        # Step 4: convert to list
-        power_orders = []
-        for loc in orderable_locations:
-            if loc in order_map:
-                power_orders.append(order_map[loc])
-            else:
-                possible = all_possible_orders.get(loc, [])
-                if possible:
-                    hold = self._hold_order(loc, possible)
-                    power_orders.append(hold if hold is not None else random.choice(possible))
+        return [orders[loc] for loc in orderable_locations if loc in orders]
 
-        return power_orders
-
-    # ------------------------------------------------------------------
-    # Retreat phase (safety net)
     # ------------------------------------------------------------------
     def _retreat_orders(self):
         all_possible_orders = self.game.get_all_possible_orders()
         orderable_locations = self.game.get_orderable_locations(self.power_name)
-        power_orders = []
+        out = []
         for loc in orderable_locations:
             possible = all_possible_orders.get(loc, [])
             if not possible:
                 continue
-            retreat_opts = [o for o in possible if ' R ' in o]
-            disband_opts = [o for o in possible if o.endswith(' D')]
-            if retreat_opts:
-                power_orders.append(random.choice(retreat_opts))
-            elif disband_opts:
-                power_orders.append(disband_opts[0])
+            r = [o for o in possible if ' R ' in o]
+            d = [o for o in possible if o.endswith(' D')]
+            if r:
+                out.append(random.choice(r))
+            elif d:
+                out.append(d[0])
             else:
-                power_orders.append(random.choice(possible))
-        return power_orders
+                out.append(possible[0])
+        return out
 
-    # ------------------------------------------------------------------
-    # Adjustment phase
     # ------------------------------------------------------------------
     def _adjustment_orders(self):
         all_possible_orders = self.game.get_all_possible_orders()
         orderable_locations = self.game.get_orderable_locations(self.power_name)
-        power_orders = []
-
+        out = []
         for loc in orderable_locations:
             possible = all_possible_orders.get(loc, [])
             if not possible:
                 continue
-
-            build_opts = [o for o in possible if o.endswith(' B')]
-            if build_opts:
-                army_builds = [o for o in build_opts if o.startswith('A')]
-                if army_builds:
-                    power_orders.append(army_builds[0])
-                else:
-                    power_orders.append(build_opts[0])
+            b = [o for o in possible if o.endswith(' B')]
+            if b:
+                a = [o for o in b if o.startswith('A')]
+                out.append(a[0] if a else b[0])
             else:
-                disband_opts = [o for o in possible if o.endswith(' D')]
-                if disband_opts:
-                    power_orders.append(disband_opts[0])
-                else:
-                    power_orders.append(random.choice(possible))
-
-        return power_orders
+                d = [o for o in possible if o.endswith(' D')]
+                out.append(d[0] if d else possible[0])
+        return out
