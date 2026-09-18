@@ -1,6 +1,7 @@
 import random
 import signal
 import networkx as nx
+from collections import defaultdict
 from agent_baselines import Agent
 
 if hasattr(signal, 'SIGALRM'):
@@ -83,7 +84,7 @@ class StudentAgent(Agent):
         lu, du = loc.upper(), dest.upper()
         for o in possible:
             p = o.split(' ')
-            if (len(p) >= 4 and p[2] == '-' and
+            if (len(p) == 4 and p[2] == '-' and
                     p[1].upper() == lu and p[3].upper() == du):
                 return o
         return None
@@ -102,7 +103,7 @@ class StudentAgent(Agent):
         lu = loc.upper()
         for o in possible:
             p = o.split(' ')
-            if len(p) >= 4 and p[2] == '-' and p[1].upper() == lu:
+            if len(p) == 4 and p[2] == '-' and p[1].upper() == lu:
                 return o
         return None
 
@@ -144,28 +145,33 @@ class StudentAgent(Agent):
         targets = [sc for sc in all_scs if sc not in my_centers]
         targets_set = set(targets)
 
-        # England opening override (only for the first two moves)
+        # Opening override for powers with hard-coded openings
         if self.power_name == 'ENGLAND':
             plan = self._england_opening(all_possible_orders)
-            if plan:
-                out = []
-                matched_all = True
-                for loc in orderable_locations:
-                    matched = False
-                    for key, order in plan.items():
-                        parts = order.split(' ')
-                        if len(parts) >= 2 and parts[1].upper() == loc.upper():
-                            if order in all_possible_orders.get(loc, []):
-                                out.append(order)
-                                matched = True
-                                break
-                    if not matched:
-                        matched_all = False
-                        break
-                if matched_all and len(out) == len(orderable_locations):
-                    return out
-                # else fall through to normal logic
+        elif self.power_name == 'FRANCE':
+            plan = self._france_opening(all_possible_orders)
+        elif self.power_name == 'ITALY':
+            plan = self._italy_opening(all_possible_orders)
+        else:
+            plan = None
 
+        if plan:
+            out = []
+            matched_all = True
+            for loc in orderable_locations:
+                matched = False
+                for key, order in plan.items():
+                    parts = order.split(' ')
+                    if len(parts) >= 2 and parts[1].upper() == loc.upper():
+                        if order in all_possible_orders.get(loc, []):
+                            out.append(order)
+                            matched = True
+                            break
+                if not matched:
+                    matched_all = False
+                    break
+            if matched_all and len(out) == len(orderable_locations):
+                return out
         # Enemy-occupied centres
         occupied_by = {}
         for p in self.game.powers.keys():
@@ -393,6 +399,87 @@ class StudentAgent(Agent):
             used.add(loc)
 
         self._adjacent_turns = new_adjacent
+
+        # Final pass: Diplomacy only lets you build at an EMPTY home centre.
+        # If we have surplus centres over units (i.e. we're entitled to
+        # build), a unit garrisoning a home centre and merely holding is
+        # costing us a future build. Since Static Agents never attack, it's
+        # free to vacate - so push it toward whatever target is nearest
+        # instead, to reopen that build slot next Winter.
+        home_centers = set(self.game.map.homes.get(self.power_name, []))
+        surplus = len(my_centers) - len(orderable_locations)
+        if surplus > 0 and home_centers:
+            for loc in orderable_locations:
+                if surplus <= 0:
+                    break
+                if loc.upper() not in home_centers:
+                    continue
+                current = orders.get(loc)
+                if current is None or not current.endswith(' H'):
+                    continue
+                best_d, best_t = float('inf'), None
+                for t in targets:
+                    d = dist(loc, t)
+                    if d < best_d:
+                        best_d, best_t = d, t
+                if best_t is None or best_d == float('inf') or best_d <= 1:
+                    continue
+                p = unit_paths[loc].get(best_t, [])
+                if len(p) <= 1:
+                    continue
+                mv = self._find_move(loc, p[1], unit_options[loc]) or self._any_move(loc, unit_options[loc])
+                if mv is not None:
+                    orders[loc] = mv
+                    surplus -= 1
+
+        # Prevent moving onto a square where one of OUR OWN units is
+        # staying put (holding) this turn - that's illegal and just
+        # bounces. A unit CAN move onto a square another of our units is
+        # simultaneously vacating (a legitimate chain), so only block
+        # destinations that resolve to a genuine hold.
+        def base(s):
+            return s.split('/')[0].upper()
+
+        own_loc_by_base = {base(loc): loc for loc in orderable_locations}
+        changed = True
+        while changed:
+            changed = False
+
+            # (a) don't move onto a square one of our own units is holding
+            for loc, order in list(orders.items()):
+                parts = order.split(' ')
+                if len(parts) != 4 or parts[2] != '-':
+                    continue
+                dest_base = base(parts[3])
+                other_loc = own_loc_by_base.get(dest_base)
+                if other_loc is None or other_loc == loc:
+                    continue
+                other_order = orders.get(other_loc)
+                if other_order is not None and other_order.endswith(' H'):
+                    h = self._hold_order(loc, unit_options[loc])
+                    new_order = h if h is not None else order
+                    if new_order != orders[loc]:
+                        orders[loc] = new_order
+                        changed = True
+
+            # (b) don't send two of our own units to the same destination
+            # (a self-inflicted bounce - distinct from a deliberate
+            # move+support pair, which uses a support order, not a second
+            # plain move)
+            dest_movers = defaultdict(list)
+            for loc, order in orders.items():
+                parts = order.split(' ')
+                if len(parts) == 4 and parts[2] == '-':
+                    dest_movers[parts[3].upper()].append(loc)
+            for dest, movers in dest_movers.items():
+                if len(movers) > 1:
+                    for loc in movers[1:]:
+                        h = self._hold_order(loc, unit_options[loc])
+                        new_order = h if h is not None else orders[loc]
+                        if new_order != orders[loc]:
+                            orders[loc] = new_order
+                            changed = True
+
         return [orders[loc] for loc in orderable_locations if loc in orders]
 
     def _send_to_nearest_unoccupied(self, loc, unoccupied_targets, unit_options,
@@ -450,7 +537,7 @@ class StudentAgent(Agent):
         all_possible_orders = self.game.get_all_possible_orders()
         orderable_locations = self.game.get_orderable_locations(self.power_name)
         out = []
-        prefer_fleet = (self.power_name == 'ENGLAND')
+        prefer_fleet = self.power_name in ('ENGLAND', 'FRANCE')
         for loc in orderable_locations:
             possible = all_possible_orders.get(loc, [])
             if not possible:
@@ -469,3 +556,29 @@ class StudentAgent(Agent):
                 d = [o for o in possible if o.endswith(' D')]
                 out.append(d[0] if d else possible[0])
         return out
+
+    def _france_opening(self, all_possible_orders):
+        plan = {}
+        current = self.game.get_current_phase()
+        if 'S1901M' in current:
+            plan['PAR'] = 'A PAR - BUR'
+            plan['MAR'] = 'A MAR - SPA'
+            plan['BRE'] = 'F BRE - MAO'
+        elif 'F1901M' in current:
+            plan['BUR'] = 'A BUR - BEL'
+            plan['SPA'] = 'A SPA - POR'
+            # MAO fleet holds or moves to ENG/PIC (whichever is legal)
+        return plan
+
+    def _italy_opening(self, all_possible_orders):
+        plan = {}
+        current = self.game.get_current_phase()
+        if 'S1901M' in current:
+            plan['VEN'] = 'A VEN - TYR'
+            plan['ROM'] = 'A ROM - TUS'
+            plan['NAP'] = 'F NAP - ION'
+        elif 'F1901M' in current:
+            plan['TYR'] = 'A TYR - VIE'
+            plan['TUS'] = 'A TUS - PIE'
+            plan['ION'] = 'F ION - TUN'
+        return plan
