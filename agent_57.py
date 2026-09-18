@@ -111,42 +111,23 @@ class StudentAgent(Agent):
         lu, du = loc.upper(), dest.upper()
         for o in possible:
             p = o.split(' ')
-            # 'A LVP - BEL VIA'
             if (len(p) >= 5 and p[0] == 'A' and p[1].upper() == lu
                     and p[2] == '-' and p[3].upper() == du
                     and p[4].upper() == 'VIA'):
                 return o
         return None
 
-    def _find_convoyed_move(self, loc, dest, possible):
-        """Return ANY convoy order from loc (destination may be flexible)."""
-        lu = loc.upper()
-        for o in possible:
-            p = o.split(' ')
-            if (len(p) >= 5 and p[0] == 'A' and p[1].upper() == lu
-                    and p[2] == '-' and p[4].upper() == 'VIA'):
-                return o
-        return None
-
     # ------------------------------------------------------------------
-    # England-specific opening moves (Spring/Fall 1901)
+    # England opening (hard-coded for the first two phases)
     # ------------------------------------------------------------------
-    def _england_opening(self, all_possible_orders, orderable_locations, phase):
-        """
-        England needs to escape its island. Hard-code the standard convoy
-        opening: move fleets to ENG and NTH in Spring 1901, then convoy the
-        army to BEL in Fall 1901.
-        """
+    def _england_opening(self, all_possible_orders):
         plan = {}
-        # Turn key: year+season from current phase
-        # phase is like 'S1901M' or 'F1901M'
-        yr = self.game.get_current_phase()
-
-        if 'S1901M' in yr:
+        current = self.game.get_current_phase()
+        if 'S1901M' in current:
             plan['LON'] = 'F LON - ENG'
             plan['EDI'] = 'F EDI - NTH'
             plan['LVP'] = 'A LVP - YOR'
-        elif 'F1901M' in yr:
+        elif 'F1901M' in current:
             plan['ENG'] = 'F ENG C A YOR - BEL'
             plan['NTH'] = 'F NTH - NWY'
             plan['YOR'] = 'A YOR - BEL'
@@ -163,31 +144,27 @@ class StudentAgent(Agent):
         targets = [sc for sc in all_scs if sc not in my_centers]
         targets_set = set(targets)
 
-        # ---- England opening override ----
+        # England opening override (only for the first two moves)
         if self.power_name == 'ENGLAND':
-            plan = self._england_opening(all_possible_orders, orderable_locations, None)
+            plan = self._england_opening(all_possible_orders)
             if plan:
                 out = []
-                used_in_plan = set()
+                matched_all = True
                 for loc in orderable_locations:
-                    # match by the origin token (last word before H/move)
                     matched = False
                     for key, order in plan.items():
                         parts = order.split(' ')
                         if len(parts) >= 2 and parts[1].upper() == loc.upper():
-                            # Verify the order is in possible
                             if order in all_possible_orders.get(loc, []):
                                 out.append(order)
-                                used_in_plan.add(loc)
                                 matched = True
                                 break
                     if not matched:
-                        # fall through to normal logic for this unit
-                        pass
-                if len(used_in_plan) == len(orderable_locations):
+                        matched_all = False
+                        break
+                if matched_all and len(out) == len(orderable_locations):
                     return out
-                # Otherwise, we'll fall through and mix with normal logic
-                # (rare; the opening should cover all 3 units)
+                # else fall through to normal logic
 
         # Enemy-occupied centres
         occupied_by = {}
@@ -274,13 +251,10 @@ class StudentAgent(Agent):
                 continue
             step = p[1]
 
-            # Try normal move
             mv = self._find_move(loc, step, unit_options[loc])
-            # If unit is an army and no normal move to `step`, try a convoy
-            if mv is None and unit_kind.get(loc) == 'A':
+            # Only England uses convoys; continental land paths exist.
+            if mv is None and self.power_name == 'ENGLAND' and unit_kind.get(loc) == 'A':
                 cv = self._find_convoy(loc, t, unit_options[loc])
-                if cv is None:
-                    cv = self._find_convoyed_move(loc, t, unit_options[loc])
                 if cv is not None:
                     orders[loc] = cv
                     used.add(loc)
@@ -405,7 +379,7 @@ class StudentAgent(Agent):
                 p = unit_paths[loc].get(best_t, [])
                 if len(p) > 1:
                     mv = self._find_move(loc, p[1], unit_options[loc])
-                    if mv is None and unit_kind.get(loc) == 'A':
+                    if mv is None and self.power_name == 'ENGLAND' and unit_kind.get(loc) == 'A':
                         cv = self._find_convoy(loc, best_t, unit_options[loc])
                         if cv is not None:
                             orders[loc] = cv
